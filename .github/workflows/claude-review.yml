@@ -1,9 +1,13 @@
-name: Claude review
+name: Claude Review
+
 on:
   pull_request:
+    branches: [main]
     types: [opened, ready_for_review, reopened]
+
 jobs:
   review:
+    name: Claude review
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -12,10 +16,12 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+          persist-credentials: false
+
+      - uses: anthropics/claude-code-action@6d5ae526d25ce88daa2200be073e1a373167f064 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
