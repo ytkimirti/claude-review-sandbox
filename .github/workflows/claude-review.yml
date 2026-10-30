@@ -14,10 +14,11 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      issues: write
+      issues: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -26,9 +27,12 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
-            Review pull request ${{ github.repository }}#${{ github.event.pull_request.number }}. The repository is checked out with the PR applied. Read the PR with `gh pr view` (including `--comments`) and `gh pr diff`.
+            Review pull request ${{ github.repository }}#${{ github.event.pull_request.number }}. The repository is checked out at the PR's head. Read the PR with `gh pr view --comments` and `gh pr diff`, and its earlier inline review comments with `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments --paginate`.
 
-            1. Spawn a fresh subagent on Opus. Give it the full diff, the PR's goal from its title and description, and the conditions the change runs under (platforms, data shapes, missing config), not your reasoning. Present it as another author's work. Ask for bugs and slop this diff introduces. Each finding: file:line, the concrete input or scenario that breaks, severity, and a 0-100 confidence. Report only. "Nothing found" is a valid answer; never say bugs exist.
+            1. Spawn a fresh `bug-finder` subagent. Give it the PR number, the PR's goal from its title and description, and the conditions the change runs under (platforms, data shapes, missing config), not your reasoning; it reads the diff itself with `gh pr diff`. Present it as another author's work, and don't tell it there are bugs. Ask for bugs and slop this diff introduces. Each finding: file:line, the concrete input or scenario that breaks, severity, and a 0-100 confidence. "Nothing found" is a valid answer.
             2. Verify each finding yourself by reading the code. Keep bugs you can confirm by tracing a concrete input to the failure, and unconfirmed ones only if confidence is 80+ and you agree after reading the code. Drop pre-existing issues, nitpicks, and anything an earlier review comment on this PR already raised.
-            3. Post each kept finding with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`) on the line it concerns: its severity, the scenario that breaks, and the fix. Use a suggestion block only when committing it fixes the issue entirely. With no kept findings, post nothing.
-          claude_args: '--model claude-opus-5-5 --allowedTools "Read,Grep,Glob,Agent,Task,Bash(gh pr view:*),Bash(gh pr diff:*),mcp__github_inline_comment__create_inline_comment"'
+            3. Post each kept finding with `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`) on a RIGHT-side line inside a diff hunk, the closest one to the problem: its severity, the scenario that breaks, and the fix. Use a suggestion block only when committing it fixes the issue entirely. With no kept findings, post nothing.
+          claude_args: |
+            --model claude-opus-5-5
+            --allowedTools "Read,Grep,Glob,Agent,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),mcp__github_inline_comment__create_inline_comment"
+            --agents '{"bug-finder":{"description":"Finds bugs a pull request introduces and reports them; posts nothing.","prompt":"You review a pull request by another author and report findings to the agent that asked. You cannot post to GitHub.","tools":["Read","Grep","Glob","Bash"],"model":"opus"}}'
