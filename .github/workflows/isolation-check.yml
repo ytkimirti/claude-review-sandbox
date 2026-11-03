@@ -25,4 +25,4 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          ~/.local/bin/claude -p 'Run these Bash commands one at a time and reply with each command and its exact output, nothing else: (1) env | grep -c -E "^(GITHUB_TOKEN|GH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN)=" (2) ps -e --no-headers | wc -l (3) ps -e -o comm --no-headers | sort | uniq -c (4) git log --oneline | wc -l (5) rg -c "export" src/cart.ts (6) curl -s -o /dev/null -w "%{http_code}" https://api.github.com (7) touch /tmp/x && echo tmp-write-ok' --model claude-haiku-5-5 --allowedTools Bash --output-format json | jq -r '.result'
+          ~/.local/bin/claude -p 'Run this one Bash command and reply with only its exact output: env | cut -d= -f1 | grep -i -E "token|key|secret|oauth" | sort' --model claude-haiku-5-5 --allowedTools Bash --output-format json | jq -r '.result'
