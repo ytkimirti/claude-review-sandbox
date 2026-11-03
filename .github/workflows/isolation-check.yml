@@ -1,0 +1,28 @@
+name: Isolation check
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install shell isolation
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends bubblewrap socat
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install Claude Code 2.1.314
+        run: curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.314
+      - name: Ask Claude to inspect its shell
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ~/.local/bin/claude -p 'Run these Bash commands one at a time and reply with each command and its exact output, nothing else: (1) env | grep -c -E "^(GITHUB_TOKEN|GH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN)=" (2) ps -e --no-headers | wc -l (3) ps -e -o comm --no-headers | sort | uniq -c (4) git log --oneline | wc -l (5) rg -c "export" src/cart.ts (6) curl -s -o /dev/null -w "%{http_code}" https://api.github.com (7) touch /tmp/x && echo tmp-write-ok' --model claude-haiku-5-5 --allowedTools Bash --output-format json | jq -r '.result'
