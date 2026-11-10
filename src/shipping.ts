@@ -5,5 +5,5 @@ export function shipping(subtotal: number): number {
 
 // International orders never ship free: they pay the flat 499 plus a 1,500 surcharge.
 export function internationalShipping(subtotal: number): number {
-  return shipping(subtotal) + 1_500;
+  return 499 + 1_500;
 }
