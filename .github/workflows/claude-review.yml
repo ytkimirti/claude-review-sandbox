@@ -2,17 +2,14 @@ name: Claude Review
 
 on:
   pull_request:
-    types: [opened, ready_for_review, reopened, synchronize]
-  issue_comment:
-    types: [created]
+    types: [opened, ready_for_review, reopened, synchronize, labeled]
 
 jobs:
   # Decides whether and how to review. A PR gets a full review when it opens, leaves draft or is reopened, and when
-  # someone with write access comments "/claude-review". A push gets a re-review of the new commits only.
+  # someone adds the `claude-review` label, which is removed again right away. A push gets a re-review of its new
+  # commits only.
   gate:
-    if: >-
-      github.event_name == 'pull_request' ||
-      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/claude-review'))
+    if: github.event.action != 'labeled' || github.event.label.name == 'claude-review'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,36 +24,28 @@ jobs:
       - id: g
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR: ${{ github.event.pull_request.number }}
           EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
           SENDER_TYPE: ${{ github.event.sender.type }}
-          COMMENTER: ${{ github.event.comment.user.login }}
-          COMMENT_ID: ${{ github.event.comment.id }}
         run: |
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
           head=$(jq -r .head.sha <<<"$pr")
           run=true full=true
-          # Fork PRs never get the secrets.
-          [ "$(jq -r .head.repo.full_name <<<"$pr")" = "$GITHUB_REPOSITORY" ] || run=false
-          if [ "$EVENT" = pull_request ]; then
-            # Bot PRs and bot pushes (dependabot, changesets) and drafts are skipped. A later push has its own run.
-            { [ "$SENDER_TYPE" = Bot ] || [ "$(jq -r .user.type <<<"$pr")" = Bot ] || [ "$(jq -r .draft <<<"$pr")" = true ] || [ "$head" != "$EVENT_HEAD" ]; } && run=false
-            if [ "$ACTION" = synchronize ]; then
-              full=false
-              # The merge rating covers the reviewed commits only. A reviewed push gets a new one from its re-review; a
-              # push that won't be reviewed (draft, bot) loses it. A stale push leaves it to the newer push's run.
-              if [ "$run" = false ] && [ "$head" = "$EVENT_HEAD" ]; then
-                for t in easy normal careful; do
-                  gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/merge:%20$t" >/dev/null 2>&1 || true
-                done
-              fi
+          [ "$ACTION" = labeled ] && { gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/claude-review" >/dev/null 2>&1 || true; }
+          # Fork PRs never get the secrets. Bot PRs and bot events (dependabot, changesets) are skipped, and so are drafts
+          # unless the label asked for a review. A push that is no longer the head has a newer run.
+          { [ "$(jq -r .head.repo.full_name <<<"$pr")" != "$GITHUB_REPOSITORY" ] || [ "$SENDER_TYPE" = Bot ] || [ "$(jq -r .user.type <<<"$pr")" = Bot ] ||
+            { [ "$(jq -r .draft <<<"$pr")" = true ] && [ "$ACTION" != labeled ]; } || [ "$head" != "$EVENT_HEAD" ]; } && run=false
+          if [ "$ACTION" = synchronize ]; then
+            full=false
+            # The merge rating covers the reviewed commits only. A reviewed push gets a new one from its re-review; a push
+            # that won't be reviewed (draft, bot) loses it. A stale push leaves it to the newer push's run.
+            if [ "$run" = false ] && [ "$head" = "$EVENT_HEAD" ]; then
+              for t in easy normal careful; do
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/merge:%20$t" >/dev/null 2>&1 || true
+              done
             fi
-          else
-            perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission 2>/dev/null || echo none)
-            case "$perm" in admin|maintain|write) ;; *) run=false ;; esac
-            [ "$run" = true ] && { gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null 2>&1 || true; }
           fi
           { echo "run=$run"; echo "pr=$PR"; echo "head=$head"; echo "base=$(jq -r .base.sha <<<"$pr")"; echo "full=$full"; } >> "$GITHUB_OUTPUT"
 
@@ -67,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
-      result: ${{ steps.review.outputs.structured_output }}
+      result: ${{ steps.review.outputs.structured_output || steps.scope.outputs.carry }}
     # One review per PR at a time; a newer request waits and replaces any older waiting one, so a burst of pushes
     # costs at most two reviews. Runs that won't review get their own group so they never displace a waiting review.
     concurrency: claude-review-${{ needs.gate.outputs.run == 'true' && needs.gate.outputs.pr || github.run_id }}
@@ -113,7 +102,7 @@ jobs:
             --jq '.data.repository.pullRequest.reviewThreads.nodes[] | {id: .comments.nodes[0].databaseId, resolved: .isResolved, path, line, comments: [.comments.nodes[] | {user: .author.login, body}]}' > review-threads.jsonl
           gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" -H "Accept: application/vnd.github.diff" > pr.diff ||
             { echo "The diff is too large to fetch. Changed files:"; gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename'; } > pr.diff
-          prev=""
+          prev="" skip=false
           if [ "$FULL" != true ]; then
             for sha in $(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/commits" --paginate --jq '.[].sha' | tac); do
               if gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status" --jq '.statuses[].context' | grep -qx 'Claude review: reviewed'; then prev=$sha; break; fi
@@ -121,13 +110,24 @@ jobs:
             [ -n "$prev" ] && ! git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$prev" "$HEAD" && prev=""
           fi
           if [ -n "$prev" ]; then
-            # A base commit missing from the checkout makes this fail; then review the whole PR.
-            if ! git -C "$GITHUB_WORKSPACE" log -p --no-merges --reverse "$HEAD" "^$prev" "^$BASE" > new.diff; then
+            # Merges show only what they changed beyond a clean merge (conflict resolutions, extra edits), so merging
+            # the base branch adds nothing. A base commit missing from the checkout makes this fail; then review it all.
+            if ! git -C "$GITHUB_WORKSPACE" log -p --remerge-diff --reverse "$HEAD" "^$prev" "^$BASE" > new.diff; then
               prev=""
-            elif [ ! -s new.diff ]; then
-              echo "No new commits from the PR since the last review at $prev; nothing to review." >> "$GITHUB_STEP_SUMMARY"
+            elif [ -z "$(git -C "$GITHUB_WORKSPACE" log -p --remerge-diff --format= "$HEAD" "^$prev" "^$BASE")" ]; then
+              # Nothing new from the PR (a clean merge of the base, or a push back to a reviewed commit): carry the last
+              # rating over to this commit.
+              skip=true
+              merge=$(gh api "repos/$GITHUB_REPOSITORY/commits/$prev/status" --jq '.statuses[] | select(.context == "Claude review: reviewed") | .description' | sed -n 's/.*merge: //p' | head -1)
               echo "skip=true" >> "$GITHUB_OUTPUT"
+              [ -z "$merge" ] || { echo "carry=$(jq -nc --arg m "$merge" --arg p "$prev" '{merge: $m, reason: "No new changes from the PR since the review of \($p); rating carried over.", fixed: []}')" >> "$GITHUB_OUTPUT"; }
             fi
+          fi
+          # The merge rating covers the reviewed commits only; this review sets a new one.
+          if [ "$skip" = false ]; then
+            for t in easy normal careful; do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/merge:%20$t" >/dev/null 2>&1 || true
+            done
           fi
           [ -z "$prev" ] || echo "focus=This is a re-review after new commits. The last review covered commit $prev, and \`new.diff\` in the same folder has the PR's own commits since then, with their patches. Ask for bugs the new changes introduce, with the whole PR as context." >> "$GITHUB_OUTPUT"
 
@@ -158,7 +158,8 @@ jobs:
       - name: Install packages
         if: steps.scope.outputs.skip != 'true'
         continue-on-error: true
-        run: pnpm install --frozen-lockfile
+        # Without install scripts, so no PR code runs outside Claude's sandbox.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - id: review
         if: steps.scope.outputs.skip != 'true'
@@ -225,4 +226,7 @@ jobs:
             [ "$old" = "$merge" ] || gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/merge:%20$old" >/dev/null 2>&1 || true
           done
           gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f "labels[]=merge: $merge" >/dev/null
+          # The label people add to ask for a full review again.
+          gh api "repos/$GITHUB_REPOSITORY/labels/claude-review" >/dev/null 2>&1 ||
+            gh api "repos/$GITHUB_REPOSITORY/labels" -f name=claude-review -f color=5319e7 -f description="Add to get a full Claude review again" >/dev/null || true
           { echo "**Merge: $merge**"; echo; jq -r .reason <<<"$OUT"; } >> "$GITHUB_STEP_SUMMARY"
