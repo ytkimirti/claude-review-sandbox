@@ -45,10 +45,13 @@ jobs:
             { [ "$SENDER_TYPE" = Bot ] || [ "$(jq -r .user.type <<<"$pr")" = Bot ] || [ "$(jq -r .draft <<<"$pr")" = true ] || [ "$head" != "$EVENT_HEAD" ]; } && run=false
             if [ "$ACTION" = synchronize ]; then
               full=false
-              # The merge rating covers the reviewed commits only; the re-review sets it again.
-              for t in easy normal careful; do
-                gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/merge:%20$t" >/dev/null 2>&1 || true
-              done
+              # The merge rating covers the reviewed commits only. A reviewed push gets a new one from its re-review; a
+              # push that won't be reviewed (draft, bot) loses it. A stale push leaves it to the newer push's run.
+              if [ "$run" = false ] && [ "$head" = "$EVENT_HEAD" ]; then
+                for t in easy normal careful; do
+                  gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$PR/labels/merge:%20$t" >/dev/null 2>&1 || true
+                done
+              fi
             fi
           else
             perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission 2>/dev/null || echo none)
@@ -64,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
-      fixed: ${{ steps.record.outputs.fixed }}
+      result: ${{ steps.review.outputs.structured_output }}
     # One review per PR at a time; a newer request waits and replaces any older waiting one, so a burst of pushes
     # costs at most two reviews. Runs that won't review get their own group so they never displace a waiting review.
     concurrency: claude-review-${{ needs.gate.outputs.run == 'true' && needs.gate.outputs.pr || github.run_id }}
@@ -76,7 +79,6 @@ jobs:
       contents: read
       pull-requests: write
       issues: read
-      statuses: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,34 +86,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Claude Code needs bubblewrap and socat for the isolation above, and refuses to start without them.
-      - name: Install shell isolation
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat && break
-            sleep 5
-          done
-          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-
-      # Packages let the reviewer typecheck, lint, run tests, and read library source. Same setup as lint.yml.
-      - uses: upstash/action-setup@v4
-        with:
-          version: 11.1.3
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: "pnpm"
-      # A failed install (say, a lockfile the PR forgot to update) still gets a review, without packages.
-      - name: Install packages
-        continue-on-error: true
-        run: pnpm install --frozen-lockfile
-
       # Writes the PR's text, diff and earlier review threads for the reviewer. On a push it also finds the last
-      # reviewed commit (marked by the "Claude review: reviewed" status) and writes what changed since, in the PR's
-      # files. Without one, or after a rebase that dropped it, the review covers the whole PR.
+      # reviewed commit (marked by the "Claude review: reviewed" status) and writes the PR's own commits since then,
+      # leaving out merges and commits from the base branch; with none, the rest of the job is skipped. Without a
+      # reviewed commit, or after a rebase that dropped it, the review covers the whole PR.
       - name: Fetch the PR for the reviewer
         id: scope
         env:
@@ -131,25 +109,59 @@ jobs:
           } > pr.md
           gh api graphql -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -F pr="$PR" -f query='
             query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-              reviewThreads(first: 100) { nodes { isResolved path line comments(first: 30) { nodes { databaseId author { login } body } } } } } } }' \
+              reviewThreads(last: 100) { nodes { isResolved path line comments(first: 30) { nodes { databaseId author { login } body } } } } } } }' \
             --jq '.data.repository.pullRequest.reviewThreads.nodes[] | {id: .comments.nodes[0].databaseId, resolved: .isResolved, path, line, comments: [.comments.nodes[] | {user: .author.login, body}]}' > review-threads.jsonl
           gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" -H "Accept: application/vnd.github.diff" > pr.diff ||
             { echo "The diff is too large to fetch. Changed files:"; gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename'; } > pr.diff
           prev=""
           if [ "$FULL" != true ]; then
             for sha in $(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/commits" --paginate --jq '.[].sha' | tac); do
-              if gh api "repos/$GITHUB_REPOSITORY/commits/$sha/statuses" --jq '.[].context' | grep -qx 'Claude review: reviewed'; then prev=$sha; break; fi
+              if gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status" --jq '.statuses[].context' | grep -qx 'Claude review: reviewed'; then prev=$sha; break; fi
             done
             [ -n "$prev" ] && ! git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$prev" "$HEAD" && prev=""
           fi
           if [ -n "$prev" ]; then
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename' > files.txt
-            mapfile -t files < files.txt
-            git -C "$GITHUB_WORKSPACE" diff "$prev" "$HEAD" -- "${files[@]}" > new.diff
+            # A base commit missing from the checkout makes this fail; then review the whole PR.
+            if ! git -C "$GITHUB_WORKSPACE" log -p --no-merges --reverse "$HEAD" "^$prev" "^$BASE" > new.diff; then
+              prev=""
+            elif [ ! -s new.diff ]; then
+              echo "No new commits from the PR since the last review at $prev; nothing to review." >> "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
-          [ -z "$prev" ] || echo "focus=This is a re-review after new commits. The last review covered commit $prev, and \`new.diff\` in the same folder has what changed since then in the PR's files. Ask for bugs the new changes introduce, with the whole PR as context." >> "$GITHUB_OUTPUT"
+          [ -z "$prev" ] || echo "focus=This is a re-review after new commits. The last review covered commit $prev, and \`new.diff\` in the same folder has the PR's own commits since then, with their patches. Ask for bugs the new changes introduce, with the whole PR as context." >> "$GITHUB_OUTPUT"
+
+      # Claude Code needs bubblewrap and socat for the isolation above, and refuses to start without them.
+      - name: Install shell isolation
+        if: steps.scope.outputs.skip != 'true'
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat && break
+            sleep 5
+          done
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # Packages let the reviewer typecheck, lint, run tests, and read library source. Same setup as lint.yml.
+      - uses: upstash/action-setup@v4
+        if: steps.scope.outputs.skip != 'true'
+        with:
+          version: 11.1.3
+          run_install: false
+      # No package cache: a comment-triggered run would save it where the default branch's runs restore it from.
+      - uses: actions/setup-node@v4
+        if: steps.scope.outputs.skip != 'true'
+        with:
+          node-version: 22
+      # A failed install (say, a lockfile the PR forgot to update) still gets a review, without packages.
+      - name: Install packages
+        if: steps.scope.outputs.skip != 'true'
+        continue-on-error: true
+        run: pnpm install --frozen-lockfile
 
       - id: review
+        if: steps.scope.outputs.skip != 'true'
         uses: anthropics/claude-code-action@6d5ae526d25ce88daa2200be073e1a373167f064 # v1.0.265
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -172,22 +184,39 @@ jobs:
             --allowedTools "Bash,Agent,mcp__github_inline_comment__create_inline_comment"
             --agents '{"bug-finder":{"description":"Finds bugs a pull request introduces and reports them; posts nothing.","prompt":"You review a pull request by another author and report findings to the agent that asked. You cannot post to GitHub.","tools":["Read","Bash"],"model":"opus","effort":"high"}}'
 
-      # Marks the reviewed commit, so the next push is reviewed from here; passes the threads it judged fixed to the
-      # resolve job; and labels the PR "merge: easy|normal|careful" (risk tiers as in Anthropic's own review flow),
-      # with the reason in the job summary. The model's output is read as data and never put into the script.
-      - name: Record the review
-        id: record
-        if: steps.review.outputs.structured_output != ''
-        env:
+  # Records a finished review in a job that runs no PR code, so the reviewer's shell never holds these permissions:
+  # marks the reviewed commit, so the next push is reviewed from there; resolves the reviewer's own threads it judged
+  # fixed (GitHub requires write access to the code for that); and labels the PR "merge: easy|normal|careful" (risk
+  # tiers as in Anthropic's own review flow), with the reason in the job summary. The model's output is read as data.
+  finish:
+    name: Record the review
+    needs: [gate, review]
+    if: needs.review.outputs.result != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.gate.outputs.pr }}
-          OUT: ${{ steps.review.outputs.structured_output }}
           HEAD: ${{ needs.gate.outputs.head }}
+          OUT: ${{ needs.review.outputs.result }}
         run: |
           merge=$(jq -r .merge <<<"$OUT")
-          case "$merge" in easy) color=0e8a16 ;; normal) color=fbca04 ;; careful) color=d93f0b ;; *) exit 0 ;; esac
+          case "$merge" in easy) color=0e8a16 ;; normal) color=fbca04 ;; careful) color=d93f0b ;; *) exit 1 ;; esac
           gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state=success -f context="Claude review: reviewed" -f description="Reviewed this commit; merge: $merge" >/dev/null
-          echo "fixed=$(jq -c '.fixed' <<<"$OUT")" >> "$GITHUB_OUTPUT"
+          gh api graphql -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+              reviewThreads(last: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } } }' \
+            --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not) | select(.comments.nodes[0].author.login == "github-actions") | "\(.comments.nodes[0].databaseId) \(.id)"' > threads.txt
+          for id in $(jq -r '.fixed[]' <<<"$OUT"); do
+            thread=$(awk -v id="$id" '$1 == id { print $2 }' threads.txt)
+            [ -n "$thread" ] || continue
+            gh api graphql -f id="$thread" -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }' >/dev/null
+            echo "Resolved fixed thread $id."
+          done
           # A newer push has its own review, which sets the label for the newer commits.
           [ "$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)" = "$HEAD" ] || { echo "PR moved past $HEAD; not labeling." >> "$GITHUB_STEP_SUMMARY"; exit 0; }
           gh api "repos/$GITHUB_REPOSITORY/labels/merge:%20$merge" >/dev/null 2>&1 ||
@@ -197,30 +226,3 @@ jobs:
           done
           gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" -f "labels[]=merge: $merge" >/dev/null
           { echo "**Merge: $merge**"; echo; jq -r .reason <<<"$OUT"; } >> "$GITHUB_STEP_SUMMARY"
-
-  # Resolves the reviewer's own threads that it judged fixed. GitHub only lets a token with write access to the code
-  # resolve threads, so this runs as its own job that runs no PR code, and the reviewer's job keeps read access.
-  resolve:
-    name: Resolve fixed threads
-    needs: [gate, review]
-    if: needs.review.outputs.fixed != '' && needs.review.outputs.fixed != '[]'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ needs.gate.outputs.pr }}
-          FIXED: ${{ needs.review.outputs.fixed }}
-        run: |
-          gh api graphql -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" -F pr="$PR" -f query='
-            query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-              reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } } }' \
-            --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not) | select(.comments.nodes[0].author.login == "github-actions") | "\(.comments.nodes[0].databaseId) \(.id)"' > threads.txt
-          for id in $(jq -r '.[]' <<<"$FIXED"); do
-            thread=$(awk -v id="$id" '$1 == id { print $2 }' threads.txt)
-            [ -n "$thread" ] || continue
-            gh api graphql -f id="$thread" -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }' >/dev/null
-            echo "Resolved fixed thread $id."
-          done
